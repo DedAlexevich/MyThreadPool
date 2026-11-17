@@ -20,10 +20,12 @@ namespace kuznetsov {
     std::future< Result > submit(std::function< Result() > function);
   private:
     void execute(size_t);
+    bool stealTasks(size_t index);
     const size_t maxThreads_;
     std::vector< std::thread > threads_;
     std::list< task > tasks_;
     std::vector< std::list< task > > threadsQueue_;
+    std::vector< std::mutex > threadsQueueMutexes_;
     std::mutex mx_;
     std::condition_variable cv_;
     size_t numThreads_;

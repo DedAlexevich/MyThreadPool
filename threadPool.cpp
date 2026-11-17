@@ -5,6 +5,7 @@
 kuznetsov::ThreadPool::ThreadPool(size_t numThreads, size_t maxThrds):
   maxThreads_(std::max(size_t{1}, maxThrds)),
   threadsQueue_(maxThreads_),
+  threadsQueueMutexes_(maxThreads_),
   numThreads_(std::min(std::max(size_t{1}, numThreads), maxThreads_)),
   stop_(false)
 {
@@ -78,14 +79,18 @@ void kuznetsov::ThreadPool::submit(task task)
 void kuznetsov::ThreadPool::execute(size_t index)
 {
   std::list< task >& tasks = threadsQueue_[index];
+  std::mutex& localMutex = threadsQueueMutexes_[index];
+
   std::unique_lock lk(mx_);
   auto hasTasks = [this]()
   {
     if (!tasks_.empty()) {
       return true;
     }
-    for (const auto& queue : threadsQueue_) {
-      if (!queue.empty()) {
+
+    for (size_t i = 0; i < threadsQueue_.size(); ++i) {
+      const std::scoped_lock lock(threadsQueueMutexes_[i]);
+      if (!threadsQueue_[i].empty()) {
         return true;
       }
     }
@@ -96,34 +101,31 @@ void kuznetsov::ThreadPool::execute(size_t index)
   {
     return stop_ || hasTasks();
   };
+
   do {
     cv_.wait(lk, proceed);
-    if (tasks.empty() && !tasks_.empty()) {
-      const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
-      auto end = std::next(tasks_.begin(), count);
-      tasks.splice(tasks.begin(), tasks_, tasks_.begin(), end);
-    }
 
-    if (tasks.empty()) {
-      for (size_t i = 0; i < threadsQueue_.size(); ++i) {
-        if (i == index || threadsQueue_[i].empty()) {
-          continue;
-        }
-
-        auto& othersTasks = threadsQueue_[i];
-        const size_t count = std::max(size_t{1}, othersTasks.size() / 3);
-        auto first = std::prev(othersTasks.end(), count);
-        tasks.splice(tasks.end(), othersTasks, first, othersTasks.end());
-        break;
+    {
+      const std::scoped_lock lock(localMutex);
+      if (tasks.empty() && !tasks_.empty()) {
+        const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
+        auto end = std::next(tasks_.begin(), count);
+        tasks.splice(tasks.begin(), tasks_, tasks_.begin(), end);
       }
     }
 
-    if (tasks.empty()) {
-      continue;
-    }
+    stealTasks(index);
 
-    auto current = std::move(tasks.front());
-    tasks.pop_front();
+    task current;
+    {
+      const std::scoped_lock lock(localMutex);
+      if (tasks.empty()) {
+        continue;
+      }
+
+      current = std::move(tasks.front());
+      tasks.pop_front();
+    }
 
     lk.unlock();
     cv_.notify_all();
@@ -138,3 +140,32 @@ void kuznetsov::ThreadPool::execute(size_t index)
   } while (!stop_ || hasTasks());
 }
 
+bool kuznetsov::ThreadPool::stealTasks(size_t index)
+{
+  std::list< task >& tasks = threadsQueue_[index];
+  std::mutex& localMutex = threadsQueueMutexes_[index];
+
+  for (size_t i = 0; i < numThreads_; ++i) {
+    if (i == index) {
+      continue;
+    }
+
+    const std::scoped_lock lock(localMutex, threadsQueueMutexes_[i]);
+
+    if (!tasks.empty()) {
+      return false;
+    }
+
+    std::list< task >& othersTasks = threadsQueue_[i];
+    if (othersTasks.empty()) {
+      continue;
+    }
+
+    const size_t count = std::max(size_t{1}, othersTasks.size() / 3);
+    auto first = std::prev(othersTasks.end(), count);
+    tasks.splice(tasks.end(), othersTasks, first, othersTasks.end());
+    return true;
+  }
+
+  return false;
+}
