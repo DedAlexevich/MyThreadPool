@@ -71,6 +71,7 @@ void kuznetsov::ThreadPool::submit(task task)
 
 void kuznetsov::ThreadPool::execute()
 {
+  std::list< task > tasks;
   std::unique_lock lk(mx_);
   do {
     auto proceed = [&]()
@@ -81,13 +82,17 @@ void kuznetsov::ThreadPool::execute()
     if (tasks_.empty()) {
       continue;
     }
-    auto task = std::move(tasks_.front());
-    tasks_.pop_front();
+    const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
+    tasks.splice(tasks.begin(), tasks_, tasks_.begin(), std::next(tasks_.begin(), count));
     lk.unlock();
-    try {
-      task();
-    } catch (...) {
+
+    for (auto it = tasks.begin(); it != tasks.end();) {
+      try {
+        (*it)();
+      } catch (...) {}
+      it = tasks.erase(it);
     }
+
     lk.lock();
   } while (!stop_ || !tasks_.empty());
 }
