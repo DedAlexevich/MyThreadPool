@@ -19,10 +19,11 @@ namespace kuznetsov {
     template< class Result >
     std::future< Result > submit(std::function< Result() > function);
   private:
-    void execute();
+    void execute(size_t);
     const size_t maxThreads_;
     std::vector< std::thread > threads_;
     std::list< task > tasks_;
+    std::vector< std::list< task > > threadsQueue_;
     std::mutex mx_;
     std::condition_variable cv_;
     size_t numThreads_;
