@@ -22,6 +22,9 @@ namespace kuznetsov {
   private:
     void execute(size_t);
     bool stealTasks(size_t index);
+    bool hasTasksLocked();
+    void tryTakeBatch(size_t index, std::shared_lock< std::shared_mutex > &globalRead);
+    bool tryPopLocal(size_t index, task &current);
     const size_t maxThreads_;
     std::vector< std::thread > threads_;
     std::list< task > tasks_;

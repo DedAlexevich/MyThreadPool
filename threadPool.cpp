@@ -76,73 +76,90 @@ void kuznetsov::ThreadPool::submit(task task)
   cv_.notify_one();
 }
 
-void kuznetsov::ThreadPool::execute(size_t index)
+bool kuznetsov::ThreadPool::hasTasksLocked()
 {
-  std::list< task >& tasks = threadsQueue_[index];
-  std::shared_mutex& localMutex = threadsQueueMutexes_[index];
+  if (!tasks_.empty()) {
+    return true;
+  }
 
-  std::shared_lock lk(mx_);
-  auto hasTasks = [this]()
-  {
-    if (!tasks_.empty()) {
+  for (size_t i = 0; i < threadsQueue_.size(); ++i) {
+    std::shared_lock localRead(threadsQueueMutexes_[i]);
+    if (!threadsQueue_[i].empty()) {
       return true;
     }
+  }
 
-    for (size_t i = 0; i < threadsQueue_.size(); ++i) {
-      const std::shared_lock lock(threadsQueueMutexes_[i]);
-      if (!threadsQueue_[i].empty()) {
-        return true;
-      }
-    }
-    return false;
-  };
+  return false;
+}
 
-  auto proceed = [&]()
+void kuznetsov::ThreadPool::tryTakeBatch(size_t index, std::shared_lock< std::shared_mutex >& globalRead)
+{
+  std::list< task >& localQueue = threadsQueue_[index];
+  std::shared_mutex& localMutex = threadsQueueMutexes_[index];
+
   {
-    return stop_ || hasTasks();
-  };
+    std::shared_lock localRead(localMutex);
+    if (!localQueue.empty() || tasks_.empty()) {
+      return;
+    }
+  }
+
+  globalRead.unlock();
+  {
+    std::unique_lock globalWrite(mx_);
+    std::unique_lock localWrite(localMutex);
+
+    if (localQueue.empty() && !tasks_.empty()) {
+      const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
+      auto end = std::next(tasks_.begin(), count);
+      localQueue.splice(localQueue.end(), tasks_, tasks_.begin(), end);
+    }
+  }
+  globalRead.lock();
+}
+
+bool kuznetsov::ThreadPool::tryPopLocal(size_t index, task& current)
+{
+  std::list< task >& queue = threadsQueue_[index];
+  std::shared_mutex& mutex = threadsQueueMutexes_[index];
+
+  {
+    std::shared_lock read(mutex);
+    if (queue.empty()) {
+      return false;
+    }
+  }
+
+  std::unique_lock write(mutex);
+  if (queue.empty()) {
+    return false;
+  }
+
+  current = std::move(queue.front());
+  queue.pop_front();
+  return true;
+}
+
+void kuznetsov::ThreadPool::execute(size_t index)
+{
+  std::shared_lock globalRead(mx_);
 
   do {
-    cv_.wait(lk, proceed);
+    cv_.wait(globalRead,
+        [this]
+        {
+          return stop_ || hasTasksLocked();
+        });
 
-    {
-      std::shared_lock localRead(localMutex);
-      if (tasks.empty() && !tasks_.empty()) {
-        localRead.unlock();
-        lk.unlock();
-        std::unique_lock globalWrite(mx_);
-        std::unique_lock localWrite(localMutex);
-        if (tasks.empty() && !tasks_.empty()) {
-          const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
-          auto end = std::next(tasks_.begin(), count);
-          tasks.splice(tasks.begin(), tasks_, tasks_.begin(), end);
-        }
-        localWrite.unlock();
-        globalWrite.unlock();
-        lk.lock();
-      }
-    }
-
+    tryTakeBatch(index, globalRead);
     stealTasks(index);
 
     task current;
-    {
-      {
-        std::shared_lock read(localMutex);
-        if (tasks.empty()) {
-          continue;
-        }
-      }
-      std::unique_lock lock(localMutex);
-      if (tasks.empty()) {
-        continue;
-      }
-
-      current = std::move(tasks.front());
-      tasks.pop_front();
+    if (!tryPopLocal(index, current)) {
+      continue;
     }
 
-    lk.unlock();
+    globalRead.unlock();
     cv_.notify_all();
 
     try {
@@ -151,46 +168,48 @@ void kuznetsov::ThreadPool::execute(size_t index)
     }
 
     current = nullptr;
-    lk.lock();
-  } while (!stop_ || hasTasks());
+    globalRead.lock();
+  } while (!stop_ || hasTasksLocked());
 }
 
 bool kuznetsov::ThreadPool::stealTasks(size_t index)
 {
-  std::list< task >& tasks = threadsQueue_[index];
+  std::list< task >& localQueue = threadsQueue_[index];
   std::shared_mutex& localMutex = threadsQueueMutexes_[index];
+
+  {
+    std::shared_lock read(localMutex);
+    if (!localQueue.empty()) {
+      return false;
+    }
+  }
 
   for (size_t i = 0; i < numThreads_; ++i) {
     if (i == index) {
       continue;
     }
 
+    std::list< task >& donorQueue = threadsQueue_[i];
+    std::shared_mutex& donorMutex = threadsQueueMutexes_[i];
+
     {
-      std::shared_lock read(localMutex);
-      if (!tasks.empty()) {
-        return false;
-      }
-    }
-    {
-      std::shared_lock read(threadsQueueMutexes_[i]);
-      if (threadsQueue_[i].empty()) {
+      std::shared_lock read(donorMutex);
+      if (donorQueue.empty()) {
         continue;
       }
     }
-    const std::scoped_lock lock(localMutex, threadsQueueMutexes_[i]);
 
-    if (!tasks.empty()) {
+    std::scoped_lock write(localMutex, donorMutex);
+    if (!localQueue.empty()) {
       return false;
     }
-
-    std::list< task >& othersTasks = threadsQueue_[i];
-    if (othersTasks.empty()) {
+    if (donorQueue.empty()) {
       continue;
     }
 
-    const size_t count = std::max(size_t{1}, othersTasks.size() / 3);
-    auto first = std::prev(othersTasks.end(), count);
-    tasks.splice(tasks.end(), othersTasks, first, othersTasks.end());
+    const size_t count = std::max(size_t{1}, donorQueue.size() / 3);
+    auto first = std::prev(donorQueue.end(), count);
+    localQueue.splice(localQueue.end(), donorQueue, first, donorQueue.end());
     return true;
   }
 
