@@ -79,9 +79,9 @@ void kuznetsov::ThreadPool::submit(task task)
 void kuznetsov::ThreadPool::execute(size_t index)
 {
   std::list< task >& tasks = threadsQueue_[index];
-  std::mutex& localMutex = threadsQueueMutexes_[index];
+  std::shared_mutex& localMutex = threadsQueueMutexes_[index];
 
-  std::unique_lock lk(mx_);
+  std::shared_lock lk(mx_);
   auto hasTasks = [this]()
   {
     if (!tasks_.empty()) {
@@ -89,7 +89,7 @@ void kuznetsov::ThreadPool::execute(size_t index)
     }
 
     for (size_t i = 0; i < threadsQueue_.size(); ++i) {
-      const std::scoped_lock lock(threadsQueueMutexes_[i]);
+      const std::shared_lock lock(threadsQueueMutexes_[i]);
       if (!threadsQueue_[i].empty()) {
         return true;
       }
@@ -106,11 +106,20 @@ void kuznetsov::ThreadPool::execute(size_t index)
     cv_.wait(lk, proceed);
 
     {
-      const std::scoped_lock lock(localMutex);
+      std::shared_lock localRead(localMutex);
       if (tasks.empty() && !tasks_.empty()) {
-        const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
-        auto end = std::next(tasks_.begin(), count);
-        tasks.splice(tasks.begin(), tasks_, tasks_.begin(), end);
+        localRead.unlock();
+        lk.unlock();
+        std::unique_lock globalWrite(mx_);
+        std::unique_lock localWrite(localMutex);
+        if (tasks.empty() && !tasks_.empty()) {
+          const size_t count = std::max(size_t{1}, tasks_.size() / numThreads_);
+          auto end = std::next(tasks_.begin(), count);
+          tasks.splice(tasks.begin(), tasks_, tasks_.begin(), end);
+        }
+        localWrite.unlock();
+        globalWrite.unlock();
+        lk.lock();
       }
     }
 
@@ -118,7 +127,13 @@ void kuznetsov::ThreadPool::execute(size_t index)
 
     task current;
     {
-      const std::scoped_lock lock(localMutex);
+      {
+        std::shared_lock read(localMutex);
+        if (tasks.empty()) {
+          continue;
+        }
+      }
+      std::unique_lock lock(localMutex);
       if (tasks.empty()) {
         continue;
       }
@@ -143,13 +158,25 @@ void kuznetsov::ThreadPool::execute(size_t index)
 bool kuznetsov::ThreadPool::stealTasks(size_t index)
 {
   std::list< task >& tasks = threadsQueue_[index];
-  std::mutex& localMutex = threadsQueueMutexes_[index];
+  std::shared_mutex& localMutex = threadsQueueMutexes_[index];
 
   for (size_t i = 0; i < numThreads_; ++i) {
     if (i == index) {
       continue;
     }
 
+    {
+      std::shared_lock read(localMutex);
+      if (!tasks.empty()) {
+        return false;
+      }
+    }
+    {
+      std::shared_lock read(threadsQueueMutexes_[i]);
+      if (threadsQueue_[i].empty()) {
+        continue;
+      }
+    }
     const std::scoped_lock lock(localMutex, threadsQueueMutexes_[i]);
 
     if (!tasks.empty()) {

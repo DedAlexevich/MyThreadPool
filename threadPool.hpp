@@ -3,6 +3,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <future>
 #include <condition_variable>
@@ -25,9 +26,9 @@ namespace kuznetsov {
     std::vector< std::thread > threads_;
     std::list< task > tasks_;
     std::vector< std::list< task > > threadsQueue_;
-    std::vector< std::mutex > threadsQueueMutexes_;
-    std::mutex mx_;
-    std::condition_variable cv_;
+    std::vector< std::shared_mutex > threadsQueueMutexes_;
+    std::shared_mutex mx_;
+    std::condition_variable_any cv_;
     size_t numThreads_;
     bool stop_;
   };
